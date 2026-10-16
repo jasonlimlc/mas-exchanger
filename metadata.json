@@ -1,0 +1,6 @@
+{
+  "name": "SingaRate - Singapore SGD Exchange Rates & FX Calculator",
+  "description": "Singapore-based foreign exchange rate tool offering real-time SGD currency conversions against global currencies, MAS benchmark rates, favorites, and travel calculator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
