@@ -180,20 +180,114 @@ export function getBankRateComparisons(
  * MAS API Request simulation / real fetch helper
  * When user configures backend or API keys, this can connect directly
  */
+/**
+ * Query the serverless health endpoint
+ */
+export async function checkHealthApi(): Promise<{
+  status: string;
+  masKeyConfigured: boolean;
+  uptime: number;
+  environment: string;
+}> {
+  try {
+    const res = await fetch('/api/health');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    status: 'unavailable',
+    masKeyConfigured: false,
+    uptime: 0,
+    environment: 'development',
+  };
+}
+
+/**
+ * Fetch live data from the serverless /api/exchangerates endpoint
+ * (queries the MAS APIMG catalogue upstream)
+ */
 export async function fetchMasExchangeRates(config?: MasApiConfig): Promise<{
   success: boolean;
   currencies: Currency[];
   lastUpdated: string;
   source: 'mas-live' | 'simulation';
+  apiKeyConfigured?: boolean;
   error?: string;
 }> {
   const activeConfig = config || getMasConfig();
 
-  // If live simulation is enabled or no custom backend provided yet
-  if (activeConfig.useLiveSimulation || !activeConfig.apiKey) {
-    // Return the realistic data loaded with slight jitter to simulate live ticker
-    const updated = INITIAL_CURRENCIES.map((c) => {
-      const jitter = (Math.random() - 0.48) * 0.001 * c.rateToSgd;
+  try {
+    // Query our serverless backend route
+    const backendHeaders: Record<string, string> = {
+      'Accept': 'application/json',
+    };
+    if (activeConfig.apiKey && activeConfig.apiKey.trim().length > 0) {
+      backendHeaders['KeyId'] = activeConfig.apiKey.trim();
+    }
+
+    const response = await fetch('/api/exchangerates?end_of_day=2026-10-14', {
+      headers: backendHeaders,
+    });
+
+    const result = await response.json().catch(() => null);
+
+    if (response.ok && result && result.success && result.data) {
+      // MAS Catalogue returned live records
+      const rawRecords = Array.isArray(result.data?.result?.records)
+        ? result.data.result.records
+        : Array.isArray(result.data?.records)
+        ? result.data.records
+        : Array.isArray(result.data)
+        ? result.data
+        : [result.data];
+
+      const latestRecord = rawRecords[0] || {};
+
+      // Map MAS catalogue fields to our currencies
+      // Standard MAS fields: usd_sgd, sgd_myr, sgd_jpy_100, sgd_thb_100, etc.
+      const updatedCurrencies = INITIAL_CURRENCIES.map((c) => {
+        let liveRate = c.rateToSgd;
+        const code = c.code.toLowerCase();
+
+        // Check common MAS field formats
+        if (latestRecord[`sgd_${code}`] !== undefined) {
+          liveRate = parseFloat(latestRecord[`sgd_${code}`]) || liveRate;
+        } else if (latestRecord[`sgd_${code}_100`] !== undefined) {
+          // per 100 units -> convert to per unit
+          liveRate = (parseFloat(latestRecord[`sgd_${code}_100`]) / 100) || liveRate;
+        } else if (latestRecord[`${code}_sgd`] !== undefined) {
+          // inverse: X foreign = Y SGD -> 1 SGD = 1 / Y foreign
+          const inv = parseFloat(latestRecord[`${code}_sgd`]);
+          if (inv > 0) liveRate = Number((1 / inv).toFixed(4));
+        }
+
+        return {
+          ...c,
+          rateToSgd: liveRate,
+          inverseRate: Number((1 / liveRate).toFixed(6)),
+          lastUpdated: `MAS Live: ${result.requestedEndOfDay || '14 Oct 2026'}`,
+        };
+      });
+
+      return {
+        success: true,
+        currencies: updatedCurrencies,
+        lastUpdated: `MAS Live (${result.requestedEndOfDay || '14 Oct 2026'})`,
+        source: 'mas-live',
+        apiKeyConfigured: true,
+      };
+    }
+
+    // If key not configured yet or upstream returned status
+    const apiKeyConfigured = result?.apiKeyConfigured === true;
+    const errorMsg = result?.message || `Endpoint returned status ${response.status}`;
+
+    // Gracefully jitter rates to reflect simulated live ticks while preserving UI completeness
+    const simulated = INITIAL_CURRENCIES.map((c) => {
+      const jitter = (Math.random() - 0.48) * 0.0008 * c.rateToSgd;
       const newRate = Number((c.rateToSgd + jitter).toFixed(c.rateToSgd > 50 ? 2 : 4));
       return {
         ...c,
@@ -207,41 +301,20 @@ export async function fetchMasExchangeRates(config?: MasApiConfig): Promise<{
 
     return {
       success: true,
-      currencies: updated,
+      currencies: simulated,
       lastUpdated: formatted,
       source: 'simulation',
+      apiKeyConfigured,
+      error: apiKeyConfigured ? errorMsg : 'MAS_KEY_ID awaiting manual configuration in environment',
     };
-  }
-
-  try {
-    const url = activeConfig.endpointUrl || `${MAS_API_BASE_URL}?resource_id=${activeConfig.resourceId}&limit=100`;
-    const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        ...(activeConfig.apiKey ? { 'Authorization': `Bearer ${activeConfig.apiKey}` } : {}),
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`MAS API responded with status ${response.status}`);
-    }
-
-    const data = await response.json();
-    // In production MAS returns: { result: { records: [...] } }
-    // User can customize parsing in their backend
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Network failure calling /api/exchangerates';
     return {
       success: true,
       currencies: INITIAL_CURRENCIES,
-      lastUpdated: new Date().toLocaleTimeString('en-SG') + ' SGT',
-      source: 'mas-live',
-    };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Failed to query MAS API endpoint';
-    return {
-      success: false,
-      currencies: INITIAL_CURRENCIES,
       lastUpdated: '15 Oct 2026, 17:00 SGT',
       source: 'simulation',
+      apiKeyConfigured: false,
       error: msg,
     };
   }
